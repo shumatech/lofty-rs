@@ -48,7 +48,7 @@ where
 		stream_length = new_stream_length;
 
 		if let Some(content) = content {
-			let reader = &mut &*content;
+			let reader = &mut std::io::Cursor::new(&*content);
 
 			let id3v2 = parse_id3v2(reader, header, parse_options).map_err(TagParseError::from)?;
 			file.id3v2_tag = Some(id3v2);

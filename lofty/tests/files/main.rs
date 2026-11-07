@@ -9,6 +9,7 @@ mod mpc;
 mod mpeg;
 mod ogg;
 mod resize;
+mod skip_cover_art;
 pub(crate) mod util;
 mod wav;
 mod wavpack;

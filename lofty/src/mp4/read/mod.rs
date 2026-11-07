@@ -110,13 +110,12 @@ where
 		len - EXTENDED_ATOM_HEADER_LEN
 	);
 
-	let pos = reader.stream_position()?;
-
-	let Some(pos) = pos.checked_add(len - EXTENDED_ATOM_HEADER_LEN) else {
+	// Relative, so this works within readers whose positions aren't relative to their bounds
+	let Ok(offset) = i64::try_from(len - EXTENDED_ATOM_HEADER_LEN) else {
 		return Err(TooMuchDataError.into());
 	};
 
-	reader.seek(SeekFrom::Start(pos))?;
+	reader.seek(SeekFrom::Current(offset))?;
 
 	Ok(())
 }

@@ -4,6 +4,7 @@ use crate::config::{ParseOptions, ParsingMode};
 use crate::id3::v2::error::FrameParseError;
 use crate::id3::v2::frame::content::parse_content;
 use crate::id3::v2::header::Id3v2Version;
+use crate::id3::v2::read::FrameRead;
 use crate::id3::v2::tag::ATTACHED_PICTURE_ID;
 use crate::id3::v2::util::synchsafe::{SynchsafeInteger, UnsynchronizedStream};
 use crate::id3::v2::{BinaryFrame, FrameFlags, FrameHeader, FrameId, Id3v2TagFlags};
@@ -28,7 +29,7 @@ impl ParsedFrame<'static> {
 		parse_options: ParseOptions,
 	) -> Result<Self, FrameParseError>
 	where
-		R: Read + ?Sized,
+		R: FrameRead + ?Sized,
 	{
 		let mut size = 0u32;
 
@@ -51,7 +52,7 @@ impl ParsedFrame<'static> {
 						log::warn!("Failed to read frame header, skipping: {}", err);
 
 						// Skip this frame and continue reading
-						skip_frame(None, reader, size)?;
+						skip_unread_frame(None, reader, size)?;
 						return Ok(Self::Skip);
 					},
 				}
@@ -59,7 +60,7 @@ impl ParsedFrame<'static> {
 		};
 
 		if !parse_options.read_cover_art && id == ATTACHED_PICTURE_ID {
-			skip_frame(Some(id), reader, size)?;
+			skip_unread_frame(Some(id), reader, size)?;
 			return Ok(Self::Skip);
 		}
 
@@ -75,7 +76,7 @@ impl ParsedFrame<'static> {
 
 			log::debug!("Encountered a zero length frame, skipping");
 
-			skip_frame(Some(id), reader, size)?;
+			skip_unread_frame(Some(id), reader, size)?;
 			return Ok(Self::Skip);
 		}
 
@@ -281,6 +282,23 @@ fn parse_frame<R: Read>(
 			Ok(ParsedFrame::Skip)
 		},
 	}
+}
+
+// Skips a frame whose content hasn't been read, through `FrameRead::skip`, which seeks when the
+// stream allows it.
+fn skip_unread_frame<R>(
+	id: Option<FrameId<'static>>,
+	reader: &mut R,
+	size: u32,
+) -> Result<(), FrameParseError>
+where
+	R: FrameRead + ?Sized,
+{
+	log::trace!("Skipping frame of size {}", size);
+
+	reader
+		.skip(u64::from(size))
+		.map_err(|e| FrameParseError::io(id, e))
 }
 
 // Note that this is only ever given the full frame size.

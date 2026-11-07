@@ -27,12 +27,34 @@ where
 {
 	let parsing_mode = parse_options.parsing_mode;
 
-	let mut contents = try_vec![0; len as usize]?;
-	reader.read_exact(&mut contents)?;
+	if parse_options.read_cover_art {
+		let mut contents = try_vec![0; len as usize]?;
+		reader.read_exact(&mut contents)?;
 
-	let mut cursor = Cursor::new(contents);
+		let mut cursor = Cursor::new(contents);
+		let mut ilst_reader = AtomReader::new(&mut cursor, parsing_mode)?;
+		return parse_ilst_atoms(&mut ilst_reader, parse_options);
+	}
 
-	let mut ilst_reader = AtomReader::new(&mut cursor, parsing_mode)?;
+	// Without cover art, parse the atoms in place, so `covr` is seeked over instead of read
+	let mut ilst_reader = AtomReader::bounded(&mut *reader, parsing_mode, len);
+	let tag = parse_ilst_atoms(&mut ilst_reader, parse_options)?;
+
+	// Leave the reader at the end of the `ilst` atom, even if parsing stopped early
+	let rest = ilst_reader.remaining();
+	ilst_reader.seek(SeekFrom::Current(rest as i64))?;
+
+	Ok(tag)
+}
+
+fn parse_ilst_atoms<R>(
+	ilst_reader: &mut AtomReader<R>,
+	parse_options: ParseOptions,
+) -> Result<Ilst, IlstParseError>
+where
+	R: Read + Seek,
+{
+	let parsing_mode = parse_options.parsing_mode;
 
 	let mut tag = Ilst::default();
 
@@ -41,15 +63,15 @@ where
 		if let AtomIdent::Fourcc(ref fourcc) = atom.ident {
 			match fourcc {
 				b"free" | b"skip" => {
-					skip_atom(&mut ilst_reader, atom.extended, atom.len)?;
+					skip_atom(ilst_reader, atom.extended, atom.len)?;
 					continue;
 				},
 				b"covr" => {
 					if parse_options.read_cover_art {
-						handle_covr(&mut ilst_reader, parsing_mode, &mut tag, &atom)
+						handle_covr(ilst_reader, parsing_mode, &mut tag, &atom)
 							.map_err(|e| e.with_ident_if_not_present(atom.ident))?;
 					} else {
-						skip_atom(&mut ilst_reader, atom.extended, atom.len)?;
+						skip_atom(ilst_reader, atom.extended, atom.len)?;
 					}
 
 					continue;
@@ -57,7 +79,7 @@ where
 				b"gnre" => {
 					log::warn!("Encountered outdated 'gnre' atom");
 
-					let Some(atom_data) = parse_data_inner(&mut ilst_reader, parsing_mode, &atom)
+					let Some(atom_data) = parse_data_inner(ilst_reader, parsing_mode, &atom)
 						.map_err(|e| e.with_ident_if_not_present(atom.ident))?
 					else {
 						continue;
@@ -102,7 +124,7 @@ where
 				// Special case the "Album ID", as it has the code "BE signed integer" (21), but
 				// must be interpreted as a "BE 64-bit Signed Integer" (74)
 				b"plID" => {
-					if let Some(atom_data) = parse_data_inner(&mut ilst_reader, parsing_mode, &atom)
+					if let Some(atom_data) = parse_data_inner(ilst_reader, parsing_mode, &atom)
 						.map_err(|e| e.with_ident_if_not_present(atom.ident))?
 					{
 						let mut data = Vec::new();
@@ -132,7 +154,7 @@ where
 					continue;
 				},
 				b"cpil" | b"hdvd" | b"pcst" | b"pgap" | b"shwm" => {
-					if let Some(atom_data) = parse_data_inner(&mut ilst_reader, parsing_mode, &atom)
+					if let Some(atom_data) = parse_data_inner(ilst_reader, parsing_mode, &atom)
 						.map_err(|e| e.with_ident_if_not_present(atom.ident.clone()))?
 						&& let Some((_, content)) = atom_data.first()
 					{
@@ -152,7 +174,7 @@ where
 			}
 		}
 
-		parse_data(&mut ilst_reader, parsing_mode, &mut tag, atom)?;
+		parse_data(ilst_reader, parsing_mode, &mut tag, atom)?;
 	}
 
 	if parse_options.implicit_conversions && !upgraded_gnres.is_empty() {

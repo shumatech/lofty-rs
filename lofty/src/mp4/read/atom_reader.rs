@@ -42,6 +42,25 @@ where
 		})
 	}
 
+	// Create an `AtomReader` over the next `len` bytes of `reader`
+	//
+	// Unlike `new`, this doesn't seek, so `reader` can itself be a bounded `AtomReader`. Positions it
+	// reports are those of the underlying stream, so only seek it with `SeekFrom::Current`.
+	pub(crate) fn bounded(reader: R, parse_mode: ParsingMode, len: u64) -> Self {
+		Self {
+			reader,
+			start: 0,
+			remaining_size: len,
+			len,
+			parse_mode,
+		}
+	}
+
+	// The bytes left within the bounds
+	pub(crate) fn remaining(&self) -> u64 {
+		self.remaining_size
+	}
+
 	/// Get the total length of the reader, including bytes already read
 	pub(crate) fn len(&self) -> u64 {
 		self.len

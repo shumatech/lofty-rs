@@ -287,11 +287,9 @@ impl<R: Read + Seek> Chunk<'_, R> {
 		parse_options: ParseOptions,
 	) -> Result<Option<Id3v2Tag>, Id3v2ParseError> {
 		use crate::id3::v2::header::Id3v2Header;
-		use crate::id3::v2::read::parse_id3v2;
+		use crate::id3::v2::read::{SeekWindow, parse_id3v2};
 
-		let content = self.content()?;
-
-		if content.len() < 10 {
+		if self.remaining_size() < 10 {
 			log::warn!("ID3 chunk too small to contain a valid header");
 			if parse_options.parsing_mode == ParsingMode::Strict {
 				return Err(FakeTagError.into());
@@ -299,10 +297,33 @@ impl<R: Read + Seek> Chunk<'_, R> {
 			return Ok(None);
 		}
 
-		let reader = &mut &*content;
+		if parse_options.read_cover_art {
+			let content = self.content()?;
+			let reader = &mut std::io::Cursor::new(content);
 
-		let header = Id3v2Header::parse(reader)?;
-		let id3v2 = parse_id3v2(reader, header, parse_options)?;
+			let header = Id3v2Header::parse(reader)?;
+			return parse_id3v2(reader, header, parse_options).map(Some);
+		}
+
+		// Without cover art, parse the tag in place, so pictures are seeked over instead of read
+		let available = u64::from(self.remaining_size());
+		let stream = self.reader.get_mut();
+		let start = stream.stream_position()?;
+		let id3v2 = {
+			let mut window = SeekWindow::new(&mut **stream, available)?;
+			let header = Id3v2Header::parse(&mut window)?;
+			parse_id3v2(&mut window, header, parse_options)?
+		};
+
+		// Account for what was consumed, as reading through the chunk would have
+		let consumed = stream
+			.stream_position()?
+			.saturating_sub(start)
+			.min(available);
+		self.reader
+			.set_limit(self.reader.limit().saturating_sub(consumed));
+		*self.chunk_remaining_size = self.chunk_remaining_size.saturating_sub(consumed as u32);
+		*self.file_remaining_size = self.file_remaining_size.saturating_sub(consumed);
 
 		Ok(Some(id3v2))
 	}

@@ -8,7 +8,103 @@ use crate::id3::v2::{Frame, FrameId, FrameList, Id3v2TagFlags, Id3v2Version, Tim
 use crate::tag::items::Timestamp;
 
 use std::borrow::Cow;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+
+// A reader of ID3v2 frames that can skip what it doesn't need, such as pictures when
+// `ParseOptions::read_cover_art` is off. Skipping seeks when the stream allows it, so the skipped
+// bytes are never read.
+pub(crate) trait FrameRead: Read {
+	fn skip(&mut self, count: u64) -> std::io::Result<()>;
+}
+
+// Skips by reading and discarding, for streams that can't seek.
+pub(crate) struct ReadToSkip<R>(pub(crate) R);
+
+impl<R: Read> Read for ReadToSkip<R> {
+	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+		self.0.read(buf)
+	}
+}
+
+impl<R: Read> FrameRead for ReadToSkip<R> {
+	fn skip(&mut self, count: u64) -> std::io::Result<()> {
+		std::io::copy(&mut self.0.by_ref().take(count), &mut std::io::sink())?;
+		Ok(())
+	}
+}
+
+// Unsynchronization changes byte counts, so skipped bytes have to be read.
+impl<R: Read> FrameRead for UnsynchronizedStream<R> {
+	fn skip(&mut self, count: u64) -> std::io::Result<()> {
+		std::io::copy(&mut self.by_ref().take(count), &mut std::io::sink())?;
+		Ok(())
+	}
+}
+
+// A window of a seekable stream: the next `len` bytes, or fewer at the end of the stream. Reads stop
+// at the end of the window, and positions are relative to its start.
+pub(crate) struct SeekWindow<'a, R> {
+	reader: &'a mut R,
+	start: u64,
+	len: u64,
+	pos: u64,
+}
+
+impl<'a, R: Read + Seek> SeekWindow<'a, R> {
+	pub(crate) fn new(reader: &'a mut R, len: u64) -> std::io::Result<Self> {
+		let start = reader.stream_position()?;
+		let end = reader.seek(SeekFrom::End(0))?;
+		reader.seek(SeekFrom::Start(start))?;
+		Ok(Self {
+			reader,
+			start,
+			len: len.min(end.saturating_sub(start)),
+			pos: 0,
+		})
+	}
+
+	// The bytes left in the window.
+	pub(crate) fn remaining(&self) -> u64 {
+		self.len.saturating_sub(self.pos)
+	}
+}
+
+impl<R: Read + Seek> Read for SeekWindow<'_, R> {
+	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+		let max = usize::try_from(self.remaining()).unwrap_or(usize::MAX);
+		let read = max.min(buf.len());
+		let read = self.reader.read(&mut buf[..read])?;
+		self.pos += read as u64;
+		Ok(read)
+	}
+}
+
+impl<R: Read + Seek> Seek for SeekWindow<'_, R> {
+	fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+		let target = match pos {
+			SeekFrom::Start(offset) => Some(offset),
+			SeekFrom::Current(offset) => self.pos.checked_add_signed(offset),
+			SeekFrom::End(offset) => self.len.checked_add_signed(offset),
+		};
+		let Some(target) = target else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"invalid seek to a negative or overflowing position",
+			));
+		};
+		self.reader.seek(SeekFrom::Start(self.start + target))?;
+		self.pos = target;
+		Ok(target)
+	}
+}
+
+impl<R: Read + Seek> FrameRead for SeekWindow<'_, R> {
+	fn skip(&mut self, count: u64) -> std::io::Result<()> {
+		let count = count.min(self.remaining());
+		self.seek(SeekFrom::Current(count as i64))?;
+		Ok(())
+	}
+}
 
 pub(crate) fn parse_id3v2<R>(
 	bytes: &mut R,
@@ -16,7 +112,7 @@ pub(crate) fn parse_id3v2<R>(
 	parse_options: ParseOptions,
 ) -> Result<Id3v2Tag, Id3v2ParseError>
 where
-	R: Read,
+	R: Read + Seek,
 {
 	log::debug!(
 		"Parsing ID3v2 tag, size: {}, version: {:?}",
@@ -24,7 +120,7 @@ where
 		header.version
 	);
 
-	let mut tag_bytes = bytes.take(u64::from(header.size - header.extended_size));
+	let mut tag_bytes = SeekWindow::new(bytes, u64::from(header.size - header.extended_size))?;
 
 	// Prior to Id3v2.4, the tag-wide `unsynchronization` flag implied that unsynchronization was applied
 	// to the *entire* content of the tag following the header, since there was no frame-level flag.
@@ -43,7 +139,8 @@ where
 	}
 
 	// Throw away the rest of the tag (padding, bad frames)
-	std::io::copy(&mut tag_bytes, &mut std::io::sink())?;
+	let rest = tag_bytes.remaining();
+	tag_bytes.skip(rest)?;
 
 	// Construct TDRC frame from TYER, TDAT, and TIME frames
 	if parse_options.implicit_conversions && header.version == Id3v2Version::V3 {
@@ -140,7 +237,7 @@ pub(super) fn read_all_frames_into_tag<R>(
 	parse_options: ParseOptions,
 ) -> Result<Id3v2Tag, FrameParseError>
 where
-	R: Read,
+	R: FrameRead,
 {
 	let mut tag = Id3v2Tag::default();
 	tag.original_version = header.version;
@@ -150,8 +247,8 @@ where
 	Ok(tag)
 }
 
-pub(super) fn read_all_frames_into_list(
-	reader: &mut dyn Read,
+pub(crate) fn read_all_frames_into_list(
+	reader: &mut dyn FrameRead,
 	version: Id3v2Version,
 	flags: Id3v2TagFlags,
 	parse_options: ParseOptions,
@@ -195,9 +292,48 @@ pub(super) fn read_all_frames_into_list(
 
 #[cfg(test)]
 mod tests {
-	use super::parse_id3v2;
+	use super::{FrameRead, SeekWindow, parse_id3v2};
 	use crate::config::ParseOptions;
 	use crate::tag::items::Timestamp;
+
+	use std::io::{Cursor, Read, Seek, SeekFrom};
+
+	#[test_log::test]
+	fn seek_window_is_bounded() {
+		let mut stream = Cursor::new((0..10).collect::<Vec<u8>>());
+		stream.seek(SeekFrom::Start(2)).unwrap();
+
+		let mut window = SeekWindow::new(&mut stream, 5).unwrap();
+		let mut buf = [0; 3];
+		window.read_exact(&mut buf).unwrap();
+		assert_eq!(buf, [2, 3, 4]);
+		assert_eq!(window.remaining(), 2);
+
+		// Skipping stops at the end of the window
+		window.skip(100).unwrap();
+		assert_eq!(window.remaining(), 0);
+		assert_eq!(window.read(&mut buf).unwrap(), 0);
+		assert_eq!(stream.position(), 7);
+	}
+
+	#[test_log::test]
+	fn seek_window_positions_are_relative() {
+		let mut stream = Cursor::new((0..10).collect::<Vec<u8>>());
+		stream.seek(SeekFrom::Start(4)).unwrap();
+
+		// The window can't extend past the end of the stream
+		let mut window = SeekWindow::new(&mut stream, 100).unwrap();
+		assert_eq!(window.remaining(), 6);
+		assert_eq!(window.seek(SeekFrom::End(-1)).unwrap(), 5);
+		let mut buf = [0; 1];
+		window.read_exact(&mut buf).unwrap();
+		assert_eq!(buf, [9]);
+		assert_eq!(window.stream_position().unwrap(), 6);
+		assert_eq!(window.seek(SeekFrom::Start(1)).unwrap(), 1);
+		window.read_exact(&mut buf).unwrap();
+		assert_eq!(buf, [5]);
+		assert!(window.seek(SeekFrom::Current(-10)).is_err());
+	}
 
 	#[test_log::test]
 	fn zero_size_id3v2() {

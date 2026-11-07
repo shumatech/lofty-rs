@@ -130,7 +130,7 @@ where
 						range: _,
 					}) = crate::id3::find_id3v2(reader, config).map_err(TagParseError::from)?
 					{
-						let reader = &mut &*content;
+						let reader = &mut std::io::Cursor::new(&*content);
 
 						let id3v2 = parse_id3v2(reader, header, parse_options)
 							.map_err(TagParseError::from)?;

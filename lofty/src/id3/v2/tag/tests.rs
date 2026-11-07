@@ -111,7 +111,7 @@ fn id3v2_re_read() {
 		.dump_to(&mut writer, WriteOptions::default())
 		.unwrap();
 
-	let temp_reader = &mut &*writer;
+	let temp_reader = &mut std::io::Cursor::new(&*writer);
 
 	let temp_header = Id3v2Header::parse(temp_reader).unwrap();
 	let temp_parsed_tag = crate::id3::v2::read::parse_id3v2(
@@ -297,9 +297,9 @@ fn id3v24_footer() {
 	let mut writer = Vec::new();
 	tag.dump_to(&mut writer, WriteOptions::default()).unwrap();
 
-	let mut reader = &mut &writer[..];
+	let reader = &mut std::io::Cursor::new(&writer[..]);
 
-	let header = Id3v2Header::parse(&mut reader).unwrap();
+	let header = Id3v2Header::parse(reader).unwrap();
 	let _ = crate::id3::v2::read::parse_id3v2(
 		reader,
 		header,
@@ -326,9 +326,9 @@ fn issue_36() {
 	let mut writer = Vec::new();
 	tag.dump_to(&mut writer, WriteOptions::default()).unwrap();
 
-	let mut reader = &mut &writer[..];
+	let reader = &mut std::io::Cursor::new(&writer[..]);
 
-	let header = Id3v2Header::parse(&mut reader).unwrap();
+	let header = Id3v2Header::parse(reader).unwrap();
 	let tag = crate::id3::v2::read::parse_id3v2(
 		reader,
 		header,

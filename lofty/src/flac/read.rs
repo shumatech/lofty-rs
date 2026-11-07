@@ -66,7 +66,7 @@ where
 	{
 		log::warn!("Encountered an ID3v2 tag. This tag cannot be rewritten to the FLAC file!");
 
-		let reader = &mut &*content;
+		let reader = &mut std::io::Cursor::new(&*content);
 
 		let id3v2 = parse_id3v2(reader, header, parse_options).map_err(TagParseError::from)?;
 		flac_file.id3v2_tag = Some(id3v2);

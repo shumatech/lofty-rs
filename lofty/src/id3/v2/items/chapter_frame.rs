@@ -1,7 +1,7 @@
 use crate::config::{ParseOptions, WriteOptions};
 use crate::id3::v2::error::{FrameEncodingError, FrameParseError};
 use crate::id3::v2::frame::list::FrameList;
-use crate::id3::v2::read::read_all_frames_into_list;
+use crate::id3::v2::read::{ReadToSkip, read_all_frames_into_list};
 use crate::id3::v2::tag::TITLE_ID;
 use crate::id3::v2::{Frame, FrameFlags, FrameHeader, FrameId, Id3v2TagFlags, Id3v2Version};
 use crate::util::alloc::VecFallibleCapacity;
@@ -194,8 +194,12 @@ impl ChapterFrame<'static> {
 		let start_offset = reader.read_u32::<BigEndian>()?;
 		let end_offset = reader.read_u32::<BigEndian>()?;
 
-		let children =
-			read_all_frames_into_list(reader, version, Id3v2TagFlags::default(), parse_options)?;
+		let children = read_all_frames_into_list(
+			&mut ReadToSkip(reader),
+			version,
+			Id3v2TagFlags::default(),
+			parse_options,
+		)?;
 
 		let header = FrameHeader::new(FRAME_ID, frame_flags);
 		Ok(ChapterFrame {
