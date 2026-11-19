@@ -360,7 +360,7 @@ where
 		file.write_all(replacement)?;
 
 		if replacement_len < old_len {
-			file.truncate(old_len - replacement_len)?;
+			file.truncate(range.start + replacement_len)?;
 		}
 
 		return Ok(());
@@ -826,6 +826,16 @@ mod tests {
 	#[test]
 	fn replace_range_shrinks() {
 		apply_range(b"0123456789".to_vec(), 2..8, b"X");
+	}
+
+	#[test]
+	fn replace_range_shrinks_at_the_end() {
+		apply_range(b"0123456789".to_vec(), 6..10, b"X");
+	}
+
+	#[test]
+	fn replace_range_grows_at_the_end() {
+		apply_range(b"0123456789".to_vec(), 6..10, b"abcdefgh");
 	}
 
 	#[test]
