@@ -8,7 +8,7 @@ use crate::macros::try_vec;
 use crate::ogg::tag::VorbisCommentsRef;
 use crate::picture::{Picture, PictureInformation};
 use crate::tag::{Tag, TagType};
-use crate::util::io::FileLike;
+use crate::util::io::{FileLike, splice_tag};
 
 use std::borrow::Cow;
 use std::io::{Read, Seek};
@@ -65,7 +65,6 @@ where
 
 	let mut is_last_block = stream_info.last;
 	let mut has_blocks_to_remove = false;
-	let mut has_padding = false;
 
 	stream_info.last = false; // Determined later
 
@@ -74,14 +73,12 @@ where
 	while !is_last_block {
 		let mut skip = false;
 		let mut block = Block::read(&mut file, |ty| match ty {
-			BLOCK_ID_PICTURE => {
+			// Pictures are written again from the tag. The old padding is part of the space the
+			// new blocks get, and is made again.
+			BLOCK_ID_PICTURE | BLOCK_ID_PADDING => {
 				has_blocks_to_remove = true;
 				skip = true;
 				false
-			},
-			BLOCK_ID_PADDING => {
-				has_padding = true;
-				true
 			},
 			_ => true,
 		})
@@ -134,27 +131,42 @@ where
 		return Ok(());
 	}
 
-	// TODO: We need to actually use padding (https://github.com/Serial-ATA/lofty-rs/issues/445)
-	let will_write_padding = !has_padding && write_options.preferred_padding.is_some();
-
 	let metadata_blocks = encode_tag(&tag.vendor, comments_peek, pictures_peek)?;
 
 	blocks.extend(metadata_blocks);
 
-	if will_write_padding && let Some(preferred_padding) = write_options.preferred_padding {
-		log::warn!("File is missing a PADDING block. Adding one");
+	// The space the old metadata took, and what a `PADDING` block filling it would hold: `None`
+	// inside when the new blocks fill it exactly, and no fit when they need more.
+	let metadata_len = blocks
+		.iter()
+		.map(|block| u64::from(block.len()))
+		.sum::<u64>();
+	let old_metadata_len = metadata_range.end - metadata_range.start;
+	let header_len = Block::BLOCK_HEADER_SIZE as u64;
+	let fit = if metadata_len == old_metadata_len {
+		Some(None)
+	} else {
+		old_metadata_len
+			.checked_sub(metadata_len + header_len)
+			.filter(|&left| left <= u64::from(Block::MAX_CONTENT_SIZE))
+			.map(Some)
+	};
 
-		let metadata_len = blocks
-			.iter()
-			.map(|block| u64::from(block.len()))
-			.sum::<u64>();
-		let old_metadata_len = metadata_range.end - metadata_range.start;
-		let available_padding = old_metadata_len
-			.saturating_sub(metadata_len)
-			.saturating_sub(Block::BLOCK_HEADER_SIZE as u64);
-		let padding_len = available_padding
-			.max(u64::from(preferred_padding.get()))
-			.min(u64::from(Block::MAX_CONTENT_SIZE));
+	// Without shifting, a fit is taken however little padding it leaves, so nothing after the
+	// metadata moves. Otherwise the preferred padding is the least there is.
+	let padding_len = match (write_options.shift_data, fit) {
+		(false, Some(padding_len)) => {
+			log::trace!("Metadata fits, padding with {padding_len:?} bytes");
+			padding_len
+		},
+		_ => write_options.preferred_padding.map(|preferred_padding| {
+			u64::from(preferred_padding.get())
+				.max(fit.flatten().unwrap_or(0))
+				.min(u64::from(Block::MAX_CONTENT_SIZE))
+		}),
+	};
+
+	if let Some(padding_len) = padding_len {
 		let padding_len = usize::try_from(padding_len).map_err(|_| SizeMismatchError)?;
 
 		// `PADDING` always goes last
@@ -175,7 +187,7 @@ where
 		);
 	}
 
-	file.splice(metadata_range, &encoded_metadata)?;
+	splice_tag(&mut file, metadata_range, &encoded_metadata, write_options)?;
 
 	Ok(())
 }

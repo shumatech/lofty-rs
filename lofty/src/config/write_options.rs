@@ -15,6 +15,7 @@ pub struct WriteOptions {
 	pub(crate) uppercase_id3v2_chunk: bool,
 	pub(crate) use_id3v23: bool,
 	pub(crate) lossy_text_encoding: bool,
+	pub(crate) shift_data: bool,
 	pub(crate) parse_options: ParseOptions,
 }
 
@@ -41,6 +42,7 @@ impl WriteOptions {
 			uppercase_id3v2_chunk: true,
 			use_id3v23: false,
 			lossy_text_encoding: true,
+			shift_data: true,
 			parse_options: ParseOptions::new(),
 		}
 	}
@@ -219,6 +221,47 @@ impl WriteOptions {
 		*self
 	}
 
+	/// Whether a write may move the data that follows a tag
+	///
+	/// A tag that grows past its padding (or shrinks) moves everything after it in the file, the
+	/// audio included, which means reading and writing most of the file. With this set to
+	/// `false`, such a write changes nothing and fails with a [`WouldShiftError`] holding the
+	/// change it would have made, so the caller can make it some other way (into a new file,
+	/// say). A tag that fits in its old space, or one at the end of the file, is still written.
+	///
+	/// This is only checked by formats that write their tags in place: FLAC, and ID3v2 at the
+	/// start of a file (MP3, AAC).
+	///
+	/// # Examples
+	///
+	/// ```rust,no_run
+	/// use lofty::config::WriteOptions;
+	/// use lofty::error::WouldShiftError;
+	/// use lofty::prelude::*;
+	/// use lofty::tag::{Tag, TagType};
+	///
+	/// # fn main() -> Result<(), lofty::error::FileEncodingError> {
+	/// let tag = Tag::new(TagType::Id3v2);
+	///
+	/// let options = WriteOptions::new().shift_data(false);
+	/// if let Err(error) = tag.save_to_path("test.mp3", options) {
+	/// 	let mut source = core::error::Error::source(&error);
+	/// 	while let Some(error) = source {
+	/// 		if let Some(shift) = error.downcast_ref::<WouldShiftError>() {
+	/// 			println!("{:?} would be replaced", shift.range());
+	/// 		}
+	/// 		source = error.source();
+	/// 	}
+	/// }
+	/// # Ok(()) }
+	/// ```
+	///
+	/// [`WouldShiftError`]: crate::error::WouldShiftError
+	pub fn shift_data(&mut self, shift_data: bool) -> Self {
+		self.shift_data = shift_data;
+		*self
+	}
+
 	/// Set the parse options for this write
 	///
 	/// This *should* be the same set of [`ParseOptions`] used for the initial read.
@@ -259,6 +302,7 @@ impl Default for WriteOptions {
 	///     uppercase_id3v2_chunk: true,
 	///     use_id3v23: false,
 	///     lossy_text_encoding: true,
+	///     shift_data: true,
 	///     parse_options: ParseOptions::default(),
 	/// }
 	/// ```

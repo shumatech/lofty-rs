@@ -268,6 +268,71 @@ impl From<AllocationError> for FileEncodingError {
 	}
 }
 
+impl From<WouldShiftError> for FileEncodingError {
+	fn from(input: WouldShiftError) -> Self {
+		Self {
+			format: None,
+			source: Box::new(input),
+		}
+	}
+}
+
+/// A write that would have moved the data after a tag, refused
+///
+/// Returned (as the source of a [`FileEncodingError`]) when [`WriteOptions::shift_data`] is
+/// `false` and the new tag doesn't fit where the old one was. Nothing was written. The file
+/// would have had [`range`](Self::range) replaced with [`replacement`](Self::replacement).
+///
+/// [`WriteOptions::shift_data`]: crate::config::WriteOptions::shift_data
+pub struct WouldShiftError {
+	range: core::ops::Range<u64>,
+	replacement: Vec<u8>,
+}
+
+impl WouldShiftError {
+	pub(crate) fn new(range: core::ops::Range<u64>, replacement: Vec<u8>) -> Self {
+		Self { range, replacement }
+	}
+
+	/// The bytes of the file that would have been replaced
+	pub fn range(&self) -> core::ops::Range<u64> {
+		self.range.clone()
+	}
+
+	/// What they would have been replaced with
+	pub fn replacement(&self) -> &[u8] {
+		&self.replacement
+	}
+
+	/// The range and its replacement
+	pub fn into_parts(self) -> (core::ops::Range<u64>, Vec<u8>) {
+		(self.range, self.replacement)
+	}
+}
+
+impl core::fmt::Display for WouldShiftError {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		write!(
+			f,
+			"replacing bytes {}..{} with {} bytes would move the data after them",
+			self.range.start,
+			self.range.end,
+			self.replacement.len()
+		)
+	}
+}
+
+impl core::fmt::Debug for WouldShiftError {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("WouldShiftError")
+			.field("range", &self.range)
+			.field("replacement_len", &self.replacement.len())
+			.finish()
+	}
+}
+
+impl core::error::Error for WouldShiftError {}
+
 /// An error that arises while parsing a tag
 pub struct TagParseError {
 	ty: Option<TagType>,

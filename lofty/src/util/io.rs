@@ -1,8 +1,9 @@
 //! Various traits for reading and writing to file-like objects
 
-use crate::config::ParseOptions;
-use crate::error::{FileParseError, UnknownFormatError};
+use crate::config::{ParseOptions, WriteOptions};
+use crate::error::{FileEncodingError, FileParseError, UnknownFormatError, WouldShiftError};
 use crate::file::FileType;
+use crate::macros::try_vec;
 use crate::probe::Probe;
 use crate::util::math::F80;
 
@@ -387,6 +388,57 @@ where
 	file.seek(SeekFrom::Start(range.start))?;
 	file.write_all(replacement)?;
 
+	Ok(())
+}
+
+/// Replaces a tag's `range` of `file` with `replacement`, as `write_options` allows
+///
+/// A replacement of the same size writes only the bytes that differ, and nothing when it's what
+/// the file already holds. One of another size moves the data after the range, unless
+/// [`WriteOptions::shift_data`] is `false` and something follows it: then nothing is written and
+/// the error is a [`WouldShiftError`] with the splice.
+///
+/// [`WriteOptions::shift_data`]: crate::config::WriteOptions::shift_data
+pub(crate) fn splice_tag<F>(
+	file: &mut F,
+	range: Range<u64>,
+	replacement: &[u8],
+	write_options: WriteOptions,
+) -> Result<(), FileEncodingError>
+where
+	F: FileLike + ?Sized,
+{
+	let old_len = range.end.saturating_sub(range.start);
+	if replacement.len() as u64 == old_len {
+		let mut current = try_vec![0; replacement.len()]?;
+		file.seek(SeekFrom::Start(range.start))?;
+		file.read_exact(&mut current)?;
+
+		let differs = |(old, new): (&u8, &u8)| old != new;
+		let Some(first) = current.iter().zip(replacement).position(differs) else {
+			log::trace!("Tag unchanged, nothing to write");
+			return Ok(());
+		};
+		let last = current
+			.iter()
+			.zip(replacement)
+			.rposition(differs)
+			.unwrap_or(first);
+
+		log::trace!(
+			"Tag fits, writing {} changed bytes in place",
+			last + 1 - first
+		);
+		file.seek(SeekFrom::Start(range.start + first as u64))?;
+		file.write_all(&replacement[first..=last])?;
+		return Ok(());
+	}
+
+	if !write_options.shift_data && range.end < Length::len(file)? {
+		return Err(WouldShiftError::new(range, replacement.to_vec()).into());
+	}
+
+	file.splice(range, &replacement)?;
 	Ok(())
 }
 
@@ -852,5 +904,105 @@ mod tests {
 		input.extend((0..(MOVE_BUFFER_SIZE * 3 + 17)).map(|index| (index % 251) as u8));
 
 		apply_range(input, 1..4, b"x");
+	}
+
+	/// A file in memory that counts the bytes written to it
+	struct Recording {
+		inner: Cursor<Vec<u8>>,
+		written: usize,
+	}
+
+	impl Recording {
+		fn new(contents: &[u8]) -> Self {
+			Self {
+				inner: Cursor::new(contents.to_vec()),
+				written: 0,
+			}
+		}
+	}
+
+	impl Read for Recording {
+		fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+			self.inner.read(buf)
+		}
+	}
+
+	impl Write for Recording {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			let written = self.inner.write(buf)?;
+			self.written += written;
+			Ok(written)
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	impl Seek for Recording {
+		fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+			self.inner.seek(pos)
+		}
+	}
+
+	impl Truncate for Recording {
+		fn truncate(&mut self, new_len: u64) -> std::io::Result<()> {
+			Truncate::truncate(&mut self.inner, new_len)
+		}
+	}
+
+	impl Length for Recording {
+		fn len(&self) -> std::io::Result<u64> {
+			Length::len(&self.inner)
+		}
+	}
+
+	fn no_shift() -> WriteOptions {
+		WriteOptions::new().shift_data(false)
+	}
+
+	#[test]
+	fn splice_tag_writes_nothing_when_unchanged() {
+		let mut file = Recording::new(b"0123456789");
+		splice_tag(&mut file, 2..5, b"234", no_shift()).unwrap();
+		assert_eq!(file.written, 0);
+		assert_eq!(file.inner.get_ref(), b"0123456789");
+	}
+
+	#[test]
+	fn splice_tag_writes_only_the_changed_bytes() {
+		let mut file = Recording::new(b"0123456789");
+		splice_tag(&mut file, 2..8, b"2X4Y67", no_shift()).unwrap();
+		assert_eq!(file.inner.get_ref(), b"012X4Y6789");
+		assert_eq!(file.written, 3, "X4Y");
+	}
+
+	#[test]
+	fn splice_tag_refuses_to_move_data_without_shifting() {
+		let mut file = Recording::new(b"0123456789");
+		let error = splice_tag(&mut file, 2..5, b"abcdef", no_shift()).unwrap_err();
+		let shift = core::error::Error::source(&error)
+			.and_then(|source| source.downcast_ref::<WouldShiftError>())
+			.expect("a WouldShiftError");
+		assert_eq!(shift.range(), 2..5);
+		assert_eq!(shift.replacement(), b"abcdef");
+		assert_eq!(file.written, 0);
+		assert_eq!(file.inner.get_ref(), b"0123456789");
+	}
+
+	#[test]
+	fn splice_tag_at_the_end_grows_and_shrinks_without_shifting() {
+		let mut file = Recording::new(b"0123456789");
+		splice_tag(&mut file, 8..10, b"abcd", no_shift()).unwrap();
+		assert_eq!(file.inner.get_ref(), b"01234567abcd");
+		splice_tag(&mut file, 8..12, b"x", no_shift()).unwrap();
+		assert_eq!(file.inner.get_ref(), b"01234567x");
+	}
+
+	#[test]
+	fn splice_tag_shifts_by_default() {
+		let mut file = Recording::new(b"0123456789");
+		splice_tag(&mut file, 2..5, b"abcdef", WriteOptions::new()).unwrap();
+		assert_eq!(file.inner.get_ref(), b"01abcdef56789");
 	}
 }

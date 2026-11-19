@@ -11,9 +11,10 @@ use crate::id3::v2::util::synchsafe::SynchsafeInteger;
 use crate::id3::{FindId3v2Config, find_id3v2};
 use crate::io::VerifiedFile;
 use crate::macros::try_vec;
-use crate::util::io::FileLike;
+use crate::util::io::{FileLike, splice_tag};
 
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::num::NonZero;
 use std::ops::Not;
 use std::sync::LazyLock;
 
@@ -52,8 +53,8 @@ where
 		tag.flags.footer = false;
 	}
 
-	let id3v2 = create_tag(tag, write_options).map_err(TagEncodingError::from)?;
 	if iff_format {
+		let id3v2 = create_tag(tag, write_options, None).map_err(TagEncodingError::from)?;
 		match file.format() {
 			FileType::Wav => {
 				return chunk_file::write_to_chunk_file::<F, LittleEndian>(
@@ -88,14 +89,21 @@ where
 		},
 	}
 
-	file.splice(replacement_range, &id3v2)?;
+	// The new tag fills the old one's space when it fits, so nothing after it moves
+	let room = replacement_range.end - replacement_range.start;
+	let id3v2 = create_tag(tag, write_options, Some(room)).map_err(TagEncodingError::from)?;
+
+	splice_tag(&mut file, replacement_range, &id3v2, write_options)?;
 
 	Ok(())
 }
 
+/// The tag's bytes. With `room` (the size of the tag it replaces, padding included), a tag that
+/// fits is padded to exactly that size; one that doesn't gets the preferred padding.
 pub(super) fn create_tag<'a, I: Iterator<Item = Frame<'a>> + 'a>(
 	tag: &mut Id3v2TagRef<'a, I>,
 	write_options: WriteOptions,
+	room: Option<u64>,
 ) -> Result<Vec<u8>, Id3v2EncodingError> {
 	let frames = &mut tag.frames;
 	let mut peek = frames.peekable();
@@ -132,8 +140,29 @@ pub(super) fn create_tag<'a, I: Iterator<Item = Frame<'a>> + 'a>(
 	let mut preferred_padding = write_options.preferred_padding;
 	if has_footer {
 		preferred_padding = None;
-	} else if let Some(preferred_padding) = preferred_padding {
-		len += preferred_padding.get() as usize;
+	} else {
+		// The whole tag as it stands: header, extended header and frames
+		let used = id3v2.get_ref().len() as u64;
+		// What padding would fill the old tag's space exactly, when the new tag fits in it
+		let fit = room.and_then(|room| room.checked_sub(used));
+		match (write_options.shift_data, fit) {
+			// Without shifting, a fit is taken however little padding it leaves
+			(false, Some(left)) => {
+				log::trace!("Tag fits, padding with the {left} bytes left");
+				// A tag's size fits in 28 bits
+				preferred_padding = u32::try_from(left).ok().and_then(NonZero::new);
+			},
+			// Otherwise the preferred padding is the least there is
+			(_, fit) => {
+				preferred_padding = preferred_padding.map(|preferred_padding| {
+					let left = fit.and_then(|left| u32::try_from(left).ok()).unwrap_or(0);
+					preferred_padding.max(NonZero::new(left).unwrap_or(preferred_padding))
+				});
+			},
+		}
+		if let Some(preferred_padding) = preferred_padding {
+			len += preferred_padding.get() as usize;
+		}
 	}
 
 	// Go back to the start and write the final size

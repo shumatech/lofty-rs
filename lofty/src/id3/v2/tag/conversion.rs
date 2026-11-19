@@ -520,7 +520,7 @@ impl<'a, I: Iterator<Item = Frame<'a>> + 'a> Id3v2TagRef<'a, I> {
 		writer: &mut W,
 		write_options: WriteOptions,
 	) -> Result<(), Id3v2EncodingError> {
-		let temp = write::create_tag(self, write_options)?;
+		let temp = write::create_tag(self, write_options, None)?;
 		writer.write_all(&temp)?;
 
 		Ok(())
