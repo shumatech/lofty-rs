@@ -1,7 +1,7 @@
 use super::data_type::DataType;
 use super::r#ref::IlstRef;
 use crate::config::WriteOptions;
-use crate::error::{FileEncodingError, FileParseError, TooMuchDataError};
+use crate::error::{FileEncodingError, FileParseError, TooMuchDataError, WouldShiftError};
 use crate::file::FileType;
 use crate::io::VerifiedFile;
 use crate::macros::try_vec;
@@ -14,7 +14,7 @@ use crate::mp4::read::{AtomReader, atom_tree, find_child_atom, meta_is_full, ver
 use crate::mp4::write::{AtomWriter, AtomWriterCompanion};
 use crate::picture::{MimeType, Picture};
 use crate::util::alloc::VecFallibleCapacity;
-use crate::util::io::FileLike;
+use crate::util::io::{FileLike, Length, splice_tag};
 
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -44,13 +44,21 @@ where
 	let mut reader = AtomReader::new(file, write_options.parse_options.parsing_mode)?;
 	verify_mp4(&mut reader).map_err(FileParseError::from)?;
 
-	// Now we can just read the entire file into memory
+	// Only `moov` is read when that's enough, so the media data isn't
 	let mut file = reader.into_inner();
 	file.rewind()?;
 
-	let mut atom_writer =
-		AtomWriter::new_from_file(&mut file, write_options.parse_options.parsing_mode)
-			.map_err(Into::<FileParseError>::into)?;
+	let parsing_mode = write_options.parse_options.parsing_mode;
+	let (atom_writer, moov_range) = match AtomWriter::new_from_moov(&mut file, parsing_mode)? {
+		Some((atom_writer, moov_range)) => (atom_writer, Some(moov_range)),
+		None => {
+			log::debug!("Reading the whole file");
+			file.rewind()?;
+			let atom_writer = AtomWriter::new_from_file(&mut file, parsing_mode)
+				.map_err(Into::<FileParseError>::into)?;
+			(atom_writer, None)
+		},
+	};
 
 	let Some(moov) = atom_writer.atoms().find_atom(*b"moov") else {
 		return Err(FileParseError::from(Mp4ParseError::missing_moov()).into());
@@ -140,7 +148,7 @@ where
 					// We'll put the new `meta` atom right at the start of `udta`
 					let meta_start_pos = udta.data_start();
 					write_handle.seek(SeekFrom::Start(meta_start_pos))?;
-					let meta_size = create_meta(write_handle, &ilst)?;
+					let meta_size = create_meta(write_handle, &padded(&ilst, write_options)?)?;
 
 					new_udta_size = udta.len + meta_size;
 					write_handle.seek(SeekFrom::Start(udta.start))?;
@@ -153,7 +161,8 @@ where
 			// We have to create the `udta` atom. Put it right at the start of `moov`.
 			let udta_pos = moov.info.data_start();
 			write_handle.seek(SeekFrom::Start(udta_pos))?;
-			new_udta_size = create_udta(write_handle, &ilst, write_options)?;
+			new_udta_size =
+				create_udta(write_handle, &padded(&ilst, write_options)?, write_options)?;
 		}
 
 		write_handle.seek(SeekFrom::Start(moov.info.start))?;
@@ -171,7 +180,19 @@ where
 		Ok(())
 	})?;
 
-	atom_writer.save_to(&mut file)?;
+	// Written over what was read: only the bytes that changed when the size is the same, `moov`
+	// alone growing or shrinking when it's last in the file
+	let contents = atom_writer.into_contents();
+	match moov_range {
+		Some(moov_range) => splice_tag(&mut file, moov_range, &contents, write_options)?,
+		None => {
+			let file_len = Length::len(&file)?;
+			if !write_options.shift_data && contents.len() as u64 != file_len {
+				return Err(WouldShiftError::new(0..file_len, contents).into());
+			}
+			splice_tag(&mut file, 0..file_len, &contents, write_options)?;
+		},
+	}
 
 	Ok(())
 }
@@ -180,7 +201,6 @@ where
 fn find_existing_ilst(
 	writer: &mut AtomWriterCompanion<'_>,
 	meta: &AtomInfo,
-	remove_tag: bool,
 	write_options: WriteOptions,
 ) -> Result<Option<Range<u64>>, FileParseError> {
 	let (ilst_idx, tree) = atom_tree(
@@ -201,12 +221,9 @@ fn find_existing_ilst(
 
 	let mut range_start = existing_ilst.start;
 	let mut range_end = existing_ilst.start + existing_ilst_size;
-	if remove_tag {
-		// If we're just removing the tag, nothing else to do
-		return Ok(Some(range_start..range_end));
-	}
 
-	// Otherwise, search for any surrounding padding atoms we can use for this write...
+	// Search for any surrounding padding atoms we can use for this write. A tag that's removed
+	// takes its padding with it, unless padding is wanted.
 
 	// Check for one directly before the `ilst` atom
 	if ilst_idx > 0 {
@@ -251,7 +268,7 @@ fn save_to_existing(
 ) -> Result<(), FileEncodingError> {
 	let range;
 
-	if let Some(existing_ilst) = find_existing_ilst(writer, &meta, remove_tag, write_options)? {
+	if let Some(existing_ilst) = find_existing_ilst(writer, &meta, write_options)? {
 		range = existing_ilst;
 	} else {
 		if remove_tag {
@@ -331,8 +348,27 @@ where
 	W: Write + Seek,
 {
 	if atom_size_difference.is_positive() {
-		log::trace!("Atom has grown, cannot avoid offset update");
-		return Ok((atom_size_difference, 0));
+		// What follows moves anyway: leave room for the next write to fit
+		let Some(preferred_padding) = write_options
+			.preferred_padding
+			.filter(|padding| padding.get() > ATOM_HEADER_LEN as u32)
+		else {
+			log::trace!("Atom has grown, cannot avoid offset update");
+			return Ok((atom_size_difference, 0));
+		};
+
+		log::trace!(
+			"Atom has grown, cannot avoid offset update, padding atom with {} bytes",
+			preferred_padding
+		);
+
+		writer.seek(SeekFrom::End(0))?;
+		write_free_atom(&mut writer, preferred_padding.get())?;
+		let padding_size = u64::from(preferred_padding.get());
+		return Ok((
+			atom_size_difference + i64::from(preferred_padding.get()),
+			padding_size,
+		));
 	}
 
 	// When the tag shrinks, we need to try and pad it out to avoid updating
@@ -373,6 +409,21 @@ where
 	padding_size = u64::from(preferred_padding.get());
 
 	Ok((atom_size_difference, padding_size))
+}
+
+/// `ilst` with the preferred padding after it, as a `free` atom, for a new `meta`: the next
+/// write can then fit without moving what follows
+fn padded(ilst: &[u8], write_options: WriteOptions) -> Result<Vec<u8>, FileEncodingError> {
+	let mut padded = ilst.to_vec();
+	if let Some(preferred_padding) = write_options.preferred_padding
+		&& preferred_padding.get() > ATOM_HEADER_LEN as u32
+		&& !ilst.is_empty()
+	{
+		let mut writer = Cursor::new(&mut padded);
+		writer.seek(SeekFrom::End(0))?;
+		write_free_atom(&mut writer, preferred_padding.get())?;
+	}
+	Ok(padded)
 }
 
 /// Write a `free` atom at the current position

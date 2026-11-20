@@ -1,13 +1,14 @@
 use crate::config::ParsingMode;
-use crate::error::FileEncodingError;
+use crate::error::{FileEncodingError, FileParseError};
+use crate::macros::try_vec;
 use crate::mp4::atom_info::{AtomIdent, AtomInfo, IDENTIFIER_LEN};
 use crate::mp4::error::{AtomParseError, Mp4ParseError};
 use crate::mp4::read::{meta_is_full, skip_atom};
-use crate::util::io::FileLike;
+use crate::util::io::{FileLike, Length};
 
 use std::cell::{RefCell, RefMut};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
@@ -121,6 +122,8 @@ impl ContextualAtoms {
 pub(super) struct AtomWriter {
 	contents: RefCell<Cursor<Vec<u8>>>,
 	atoms: ContextualAtoms,
+	/// Where `contents` starts in the file: 0 for the whole file, `moov`'s offset for `moov` alone
+	base: u64,
 }
 
 impl AtomWriter {
@@ -131,6 +134,7 @@ impl AtomWriter {
 		Self {
 			contents: RefCell::new(Cursor::new(content)),
 			atoms: ContextualAtoms(Vec::new()),
+			base: 0,
 		}
 	}
 
@@ -158,7 +162,74 @@ impl AtomWriter {
 		Ok(Self {
 			contents: RefCell::new(contents),
 			atoms: ContextualAtoms(atoms),
+			base: 0,
 		})
+	}
+
+	/// Create a new [`AtomWriter`] over the file's `moov` atom alone, and its range in the file
+	///
+	/// Only the top-level atom headers and `moov` are read, so the media data isn't. Everything a
+	/// tag write changes is inside `moov`, and the chunk offsets it holds are moved only for data
+	/// after it. `None` when there's no `moov`, or the file is fragmented: its `moof` atoms have
+	/// offsets too, outside `moov`.
+	pub(super) fn new_from_moov<F>(
+		file: &mut F,
+		parse_mode: ParsingMode,
+	) -> Result<Option<(Self, Range<u64>)>, FileEncodingError>
+	where
+		F: FileLike,
+	{
+		let parse_error = |error: AtomParseError| FileParseError::from(Mp4ParseError::from(error));
+
+		let file_len = Length::len(file)?;
+		let mut pos = 0;
+		let mut moov = None;
+		while pos < file_len {
+			file.seek(SeekFrom::Start(pos))?;
+			let Some(info) =
+				AtomInfo::read(file, file_len - pos, parse_mode).map_err(parse_error)?
+			else {
+				break;
+			};
+
+			match info.ident {
+				AtomIdent::Fourcc(ident) if ident == *b"moof" => return Ok(None),
+				AtomIdent::Fourcc(ident) if ident == *b"moov" && moov.is_none() => {
+					moov = Some(info.start..info.start + info.len);
+				},
+				_ => {},
+			}
+
+			if info.len == 0 {
+				break;
+			}
+			pos = info.start + info.len;
+		}
+
+		let Some(range) = moov else {
+			return Ok(None);
+		};
+
+		let moov_len = range.end - range.start;
+		let mut contents = Cursor::new(try_vec![0; moov_len as usize]?);
+		file.seek(SeekFrom::Start(range.start))?;
+		file.read_exact(contents.get_mut())?;
+
+		let mut len = moov_len;
+		let atoms = ContextualAtom::read(&mut contents, &mut len, parse_mode)
+			.map_err(parse_error)?
+			.into_iter()
+			.collect();
+		contents.rewind()?;
+
+		log::debug!("Read `moov` alone: {moov_len} bytes at {}", range.start);
+
+		let writer = Self {
+			contents: RefCell::new(contents),
+			atoms: ContextualAtoms(atoms),
+			base: range.start,
+		};
+		Ok(Some((writer, range)))
 	}
 
 	pub(super) fn atoms(&self) -> &ContextualAtoms {
@@ -185,6 +256,7 @@ impl AtomWriter {
 			shift_pos: None,
 			original_length,
 			atoms: self.atoms(),
+			base: self.base,
 			contents,
 		};
 
@@ -192,17 +264,6 @@ impl AtomWriter {
 			Ok(val) => companion.finish().map(|_| val),
 			Err(e) => Err(e.into()),
 		}
-	}
-
-	pub(super) fn save_to<F>(&mut self, file: &mut F) -> Result<(), FileEncodingError>
-	where
-		F: FileLike,
-	{
-		file.rewind()?;
-		file.truncate(0)?;
-		file.write_all(self.contents.borrow().get_ref())?;
-
-		Ok(())
 	}
 }
 
@@ -213,6 +274,9 @@ pub(super) struct AtomWriterCompanion<'a> {
 	shift_pos: Option<u64>,
 	original_length: usize,
 	atoms: &'a ContextualAtoms,
+	/// Where the contents start in the file, for comparing the file offsets in `stco`, `co64` and
+	/// `tfhd` with `shift_pos`
+	base: u64,
 	contents: RefMut<'a, Cursor<Vec<u8>>>,
 }
 
@@ -326,6 +390,9 @@ impl AtomWriterCompanion<'_> {
 			return Ok(());
 		};
 
+		// The offsets are the file's; everything from here on moved
+		let shifted_from = self.base + shift_pos;
+
 		log::debug!("Checking for offset atoms to update");
 
 		// 32-bit offsets
@@ -345,7 +412,7 @@ impl AtomWriterCompanion<'_> {
 			let count = self.read_u32::<BigEndian>()?;
 			for _ in 0..count {
 				let read_offset = self.read_u32::<BigEndian>()?;
-				if u64::from(read_offset) < shift_pos {
+				if u64::from(read_offset) < shifted_from {
 					continue;
 				}
 				self.seek(SeekFrom::Current(-4))?;
@@ -375,7 +442,7 @@ impl AtomWriterCompanion<'_> {
 			let count = self.read_u32::<BigEndian>()?;
 			for _ in 0..count {
 				let read_offset = self.read_u64::<BigEndian>()?;
-				if read_offset < shift_pos {
+				if read_offset < shifted_from {
 					continue;
 				}
 
@@ -413,7 +480,7 @@ impl AtomWriterCompanion<'_> {
 
 			if base_data_offset {
 				let read_offset = self.read_u64::<BigEndian>()?;
-				if read_offset < shift_pos {
+				if read_offset < shifted_from {
 					continue;
 				}
 
