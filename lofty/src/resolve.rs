@@ -113,11 +113,11 @@ impl<T: FileResolver> ObjectSafeFileResolver for GhostlyResolver<T> {
 /// * See [`Mutex::lock`]
 pub fn register_custom_resolver<T: FileResolver + 'static>(name: &'static str) {
 	let mut res = CUSTOM_RESOLVERS.lock().unwrap();
-	assert!(
-		res.iter().all(|(n, _)| *n != name),
-		"Resolver `{}` already exists!",
-		name
-	);
+	if res.iter().any(|(n, _)| *n == name) {
+		// Not while holding the lock: a poisoned lock would hide every resolver after this
+		drop(res);
+		panic!("Resolver `{name}` already exists!");
+	}
 
 	let ghost = GhostlyResolver::<T>(PhantomData);
 	let b: Box<dyn ObjectSafeFileResolver> = Box::new(ghost);
@@ -212,5 +212,8 @@ mod tests {
 			.is_err(),
 			"We didn't panic on double register!"
 		);
+
+		// The panic doesn't take the other file types with it
+		assert_eq!(FileType::from_ext("mp3"), Some(FileType::Mpeg));
 	}
 }
